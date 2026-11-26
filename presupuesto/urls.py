@@ -1,6 +1,6 @@
 from django.contrib import admin
 from django.urls import path
-from presupuesto import solicitudes_view as view, certificado_pdf as pdf_view
+from presupuesto import solicitudes_view as view, certificado_pdf as pdf_view, administracion as adm
 from presupuesto.catalogo import *
 urlpatterns = [
     path("solicitudes/list", view.solicitudes_list, name='solicitudes_list'),
@@ -16,5 +16,12 @@ urlpatterns = [
     path('cuentas-analiticas/list/', cuentas_analiticas_list, name='cuentas-analiticas-list'),  
     path('cuentas-contables/list/', cuentas_contables_list, name='cuentas-contables-list'),  
     path('certificado/edit/<int:pk>/', pdf_view.get_certificado_template, name='get_certificado_template'),
-    path('certificado/create/<int:pk>/', pdf_view.generar_certificado_pdf, name='certificado_create'),  
+    path('certificado/create/<int:pk>/', pdf_view.generar_certificado_pdf, name='certificado_create'),
+    # Pantalla Administración de React (presupuesto/administracion.py)
+    path('administracion/cuentas-analiticas/', adm.CuentasAnaliticas.as_view(), name='adm-cuentas-analiticas'),
+    path('administracion/cuentas-analiticas/<int:pk>/', adm.CuentasAnaliticas.as_view()),
+    path('administracion/cuentas-contables/', adm.CuentasContables.as_view(), name='adm-cuentas-contables'),
+    path('administracion/cuentas-contables/<int:pk>/', adm.CuentasContables.as_view()),
+    path('administracion/parametros/', adm.Parametros.as_view(), name='adm-parametros'),
+    path('administracion/parametros/<str:nombre>/', adm.Parametros.as_view()),
 ]

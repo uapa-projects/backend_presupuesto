@@ -2,23 +2,24 @@ from ninja import Router
 from ninja import NinjaAPI, Schema
 from django.shortcuts import get_object_or_404
 from typing import List
-from django.contrib.auth.models import User
+import uuid
 from decimal import Decimal
-from ..models import SolicitudPresupuesto, CuentaAnalitica, Sede
+from authentication import directorio
 
 router = Router()
 
 class ColaboradorOut(Schema):
-    id: int
+    id: uuid.UUID
     first_name: str
     last_name: str
     email: str
 
     @staticmethod
     def resolve_full_name(obj):
-        return f"{obj.first_name} {obj.last_name}".strip() or obj.username
+        return obj.get_full_name()
 
 @router.get("/list", response=List[ColaboradorOut])
 def listar_colaboradores(request):
-    # Traemos usuarios activos para que no aparezcan ex-empleados en la lista
-    return User.objects.filter(is_active=True).order_by('first_name')
+    # Usuarios activos con acceso a CEP en la plataforma (para que no aparezcan ex-empleados en la lista)
+    lista = [directorio.Persona(u['id'], u) for u in directorio.buscar_usuarios(app='cep', limit=500)]
+    return sorted(lista, key=lambda p: p.first_name)

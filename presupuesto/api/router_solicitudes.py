@@ -2,9 +2,10 @@ from ninja import Router
 from ninja import NinjaAPI, Schema
 from django.shortcuts import get_object_or_404
 from typing import List
-from django.contrib.auth.models import User
+import uuid
 from decimal import Decimal
-from ..models import SolicitudPresupuesto, CuentaAnalitica, Sede
+from authentication.roles import es_supervisor
+from ..models import SolicitudPresupuesto, CuentaAnalitica
 
 router = Router()
 
@@ -14,7 +15,7 @@ class SolicitudOut(Schema):
     descripcion: str
     monto_a_ejecutar: Decimal
     estado: str
-    colaborador_nombre: str = None 
+    colaborador_nombre: str = None
     ubicacion_nombre: str = None
     cuenta_analitica_nombre: str = None
 
@@ -36,29 +37,27 @@ class SolicitudIn(Schema):
     descripcion: str
     tipo_solicitud: str
     rubro_presupuestal: str
-    ubicacion_id: int          # React enviará el ID seleccionado
+    ubicacion_id: uuid.UUID    # id del recinto en la plataforma
     cuenta_analitica_id: int   # React enviará el ID seleccionado
     presupuesto_pre_aprobado: Decimal
     monto_a_ejecutar: Decimal
     # 1. Listar solicitudes (El Supervisor ve todas, el Colaborador solo las suyas)
 @router.get("/list", response=List[SolicitudOut])
 def listar_solicitudes(request):
-    qs = SolicitudPresupuesto.objects.select_related(
-        'colaborador', 'ubicacion', 'cuenta_analitica'
-    )
-    if request.user.is_superuser or request.user.groups.filter(name='Supervisor').exists():
+    qs = SolicitudPresupuesto.objects.select_related('cuenta_analitica')
+    if es_supervisor(request.user):
         return qs.all()
-    
-    return qs.filter(colaborador=request.user)
+
+    return qs.filter(colaborador_id=request.user.id)
 
 @router.post("/create")
 def crear_solicitud(request, data: SolicitudIn):
     # Ninja ya validó que 'data' trae todos los campos y que son del tipo correcto
-    
+
     # Creamos la instancia en la DB
     solicitud = SolicitudPresupuesto.objects.create(
         **data.dict(),            # Desempaqueta nombre, descripción, etc.
-        colaborador=request.user  # Asignamos al usuario que está logueado
+        colaborador_id=request.user.id  # UUID del usuario de la plataforma
     )
-    
+
     return {"id": solicitud.id, "status": "success"}

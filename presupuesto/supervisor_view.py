@@ -1,5 +1,6 @@
 from django.contrib.auth.mixins import LoginRequiredMixin, UserPassesTestMixin
 from django.views.generic import ListView
+from authentication.roles import es_supervisor
 from .models import SolicitudPresupuesto
 
 class PanelSupervisorView(LoginRequiredMixin, UserPassesTestMixin, ListView):
@@ -8,9 +9,8 @@ class PanelSupervisorView(LoginRequiredMixin, UserPassesTestMixin, ListView):
     context_object_name = 'solicitudes'
 
     def test_func(self):
-        # Solo permite el acceso si el usuario es superusuario 
-        # o pertenece al grupo 'Supervisor'
-        return self.request.user.is_superuser or self.request.user.groups.filter(name='Supervisor').exists()
+        # Solo Supervisor o Administrador en la plataforma
+        return es_supervisor(self.request.user)
 
     def get_queryset(self):
         # El supervisor ve TODO, pero ponemos las PENDIENTES primero

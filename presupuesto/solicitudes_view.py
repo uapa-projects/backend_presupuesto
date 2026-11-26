@@ -12,9 +12,13 @@ from django.http import HttpResponse, JsonResponse
 from django.utils import timezone
 from decimal import Decimal
 
-from presupuesto import utils
-from .models import Configuracion, SolicitudPresupuesto, AdjuntoSolicitud, Sede, RevisionSolicitud
-from core.serializer import BaseSerializer 
+from presupuesto import pendientes, utils
+from authentication import roles
+import uuid
+
+from authentication import directorio
+from .models import Configuracion, SolicitudPresupuesto, AdjuntoSolicitud, RevisionSolicitud
+from core.serializer import BaseSerializer
 from core.utils.login_required import login_required_json
 from .google_drive import obtener_carpeta_en_drive, upload_to_drive, delete_from_drive
 from emails.mailer import send_email
@@ -22,24 +26,27 @@ from core.utils.logging import log_error
 from .utils import enviar_email_solicitud_creada, enviar_email_a_compras, FrontendRequest
 #Presupuesto files
 def es_supervisor(user):
-    return user.groups.filter(name='Supervisor').exists() or user.is_superuser
+    """Supervisor o Administrador en la plataforma (authentication/roles.py)."""
+    return roles.es_supervisor(user)
 
 def es_colaborador(user):
-    return user.groups.filter(name='Colaborador').exists()
-
-EXCLUDE_COLABORADOR = [
-    'colaborador__password',
-    'colaborador__is_staff',
-    'colaborador__is_superuser',
-    'colaborador__last_login'
-]
-
+    return roles.tiene_rol(user, roles.ROL_COLABORADOR)
 
 def _serialize_solicitudes(qs):
-    serializer = BaseSerializer(qs, exclude=EXCLUDE_COLABORADOR)
-    data = serializer.serialize()
-    for item in data:        
+    # Colaboradores, supervisores y sedes son de la plataforma: se piden todos juntos (una llamada, con caché).
+    personas = directorio.personas({x.colaborador_id for x in qs} |
+                                   {r.supervisor_id for x in qs for r in x.revisiones.all()})
+    sedes = {}
+    for x in qs:
+        if x.ubicacion_id not in sedes:
+            sedes[x.ubicacion_id] = directorio.sede_cep(x.ubicacion_id)
+    data = BaseSerializer(qs).serialize()
+    for item in data:
         obj = next(x for x in qs if x.id == item['id'])
+        item.pop('colaborador_id', None)
+        item.pop('ubicacion_id', None)
+        item['colaborador'] = personas[obj.colaborador_id].como_dict()
+        item['ubicacion'] = sedes[obj.ubicacion_id].como_dict() if obj.ubicacion_id else None
         item['files'] = [
             {'id': a.id, 'nombre': a.nombre, 'url_view': a.url_view,
              'es_certificado': a.es_certificado, 'aprobado': a.aprobado}
@@ -48,7 +55,7 @@ def _serialize_solicitudes(qs):
         item['tiene_certificado'] = any(a['es_certificado'] for a in item['files'])
         item['review_notes'] = [
             {'id': c.id, 'contenido': c.contenido,
-             'supervisor': c.supervisor.get_full_name() or c.supervisor.username,
+             'supervisor': personas[c.supervisor_id].get_full_name(),
              'fecha_creacion': c.fecha_creacion.isoformat(timespec='seconds'), 'estado': c.estado}
             for c in obj.revisiones.all()
         ]
@@ -57,34 +64,34 @@ def _serialize_solicitudes(qs):
 
 def _build_qs(user, fecha_limite=None):
     from django.db.models import Prefetch
-    base_qs = SolicitudPresupuesto.objects.select_related(
-        'colaborador', 'ubicacion', 'cuenta_analitica'
-    ).prefetch_related(
+    base_qs = SolicitudPresupuesto.objects.select_related('cuenta_analitica').prefetch_related(
         'adjuntos',
-        Prefetch('revisiones', queryset=RevisionSolicitud.objects.select_related('supervisor').order_by('-fecha_creacion'))
+        Prefetch('revisiones', queryset=RevisionSolicitud.objects.order_by('-fecha_creacion'))
     )
-    es_supervisor = user.is_superuser or user.groups.filter(name='Supervisor').exists()
-    es_compra_rss = user.groups.filter(name='Compra RSS').exists()
-    
-    if es_compra_rsd := user.groups.filter(name='Compra RSD').exists():
+    es_supervisor = roles.es_supervisor(user)
+    # Roles de compra de la plataforma (antes, grupos de Django)
+    es_compra_rss = roles.tiene_rol(user, roles.ROL_COMPRA_RSS)
+
+    if es_compra_rsd := roles.tiene_rol(user, roles.ROL_COMPRA_RSD):
         sede_codigo = 'RSD'
-    elif es_compra_rco := user.groups.filter(name='Compra RCO').exists():
+    elif es_compra_rco := roles.tiene_rol(user, roles.ROL_COMPRA_RCO):
         sede_codigo = 'RCO'
     else:
         sede_codigo = None
-    
+
     filtros_base = {}
     filtros_fecha = {'updated_at__gte': fecha_limite} if fecha_limite else {}
-    
+
     if es_supervisor or es_compra_rss:
         qs_pendientes = base_qs.filter(estado='PENDIENTE', **filtros_fecha).order_by('-fecha_solicitud')
         qs_otras = base_qs.exclude(estado='PENDIENTE').filter(**filtros_fecha).order_by('-fecha_solicitud')
     elif sede_codigo:
-        filtros_base['ubicacion__codigo'] = sede_codigo
+        recinto = directorio.recinto_por_codigo(sede_codigo)  # RSD / RCO = recinto_abreviatura en la plataforma
+        filtros_base['ubicacion_id'] = recinto['id'] if recinto else uuid.UUID(int=0)
         qs_pendientes = base_qs.filter(estado='PENDIENTE', **filtros_base, **filtros_fecha).order_by('-fecha_solicitud')
         qs_otras = base_qs.exclude(estado='PENDIENTE').filter(**filtros_base, **filtros_fecha).order_by('-fecha_solicitud')
     else:
-        filtros_base['colaborador'] = user
+        filtros_base['colaborador_id'] = user.id
         qs_pendientes = base_qs.filter(estado='PENDIENTE', **filtros_base, **filtros_fecha).order_by('-fecha_solicitud')
         qs_otras = base_qs.exclude(estado='PENDIENTE').filter(**filtros_base, **filtros_fecha).order_by('-fecha_solicitud')
     return list(itertools.chain(qs_pendientes, qs_otras))
@@ -113,17 +120,17 @@ def procesar_datos_solicitud(request, solicitud=None):
     solicitud.rubro_presupuestal = data.get('rubro_presupuestal', solicitud.rubro_presupuestal)
 
     if data.get('ubicacion_id'):
-        solicitud.ubicacion_id = int(data.get('ubicacion_id'))
+        solicitud.ubicacion_id = uuid.UUID(str(data.get('ubicacion_id')))  # id del recinto en la plataforma
     if data.get('cuenta_analitica_id'):
         solicitud.cuenta_analitica_id = int(data.get('cuenta_analitica_id'))
 
     solicitud.monto_a_ejecutar = Decimal(data.get('monto_a_ejecutar', solicitud.monto_a_ejecutar)).quantize(Decimal('0.00'))
     solicitud.presupuesto_pre_aprobado = Decimal(data.get('presupuesto_pre_aprobado', solicitud.presupuesto_pre_aprobado)).quantize(Decimal('0.00'))
-    
+
     dt = parse_datetime(data.get('fecha_actividad'))
     if dt:
         solicitud.fecha_actividad = dt.date()
-    
+
     solicitud.full_clean()
     solicitud.save()
 
@@ -160,11 +167,11 @@ def refresh_solicitudes(request):
 def crear_solicitud(request):
     if request.method != 'POST':
         return JsonResponse({"error": "Método no permitido"}, status=405)
-    
+
     try:
         with transaction.atomic():
             nueva_solicitud = procesar_datos_solicitud(request)
-            
+
             # --- Notificación solo al crear ---
             context = {
                 'id': nueva_solicitud.id,
@@ -174,7 +181,8 @@ def crear_solicitud(request):
                 'monto_a_ejecutar': nueva_solicitud.monto_a_ejecutar,
                 'url_solicitud': FrontendRequest.VIEW.url(request, nueva_solicitud.id)
             }
-            enviar_email_solicitud_creada(context)        
+            enviar_email_solicitud_creada(context)
+            pendientes.sincronizar(request, nueva_solicitud)  # «Revisar solicitud» para los Supervisores
             serializer = BaseSerializer([nueva_solicitud])
             return JsonResponse({"mensaje": "Creada con éxito", "datos": serializer.serialize()[0]}, status=201)
     except Exception as e:
@@ -186,10 +194,11 @@ def crear_solicitud(request):
 def editar_solicitud(request, pk):
     solicitud = get_object_or_404(SolicitudPresupuesto, pk=pk)
     if request.method != 'POST':
-        return JsonResponse({"error": "Método no permitido"}, status=405)    
+        return JsonResponse({"error": "Método no permitido"}, status=405)
     try:
         with transaction.atomic():
-            solicitud_editada = procesar_datos_solicitud(request, solicitud=solicitud)            
+            solicitud_editada = procesar_datos_solicitud(request, solicitud=solicitud)
+            pendientes.sincronizar(request, solicitud_editada)  # título y supervisores al día
             serializer = BaseSerializer([solicitud_editada])
             return JsonResponse({"mensaje": "Actualizada con éxito", "datos": serializer.serialize()[0]}, status=200)
     except ValueError as e:
@@ -201,7 +210,7 @@ def editar_solicitud(request, pk):
         return JsonResponse({"error": str(e)}, status=400)
 
 #@csrf_exempt
-@login_required_json                                                                                                                                                                                                                                                                                
+@login_required_json
 def cambiar_estado(request, pk):
     if request.method == 'PATCH':
         try:
@@ -219,9 +228,9 @@ def cambiar_estado(request, pk):
             if not nuevo_estado:
                 return JsonResponse({"error": "El campo 'status' es obligatorio"}, status=400)
 
-            # 3. Lógica de negocio para el estado                                                                                                                                                                                   
+            # 3. Lógica de negocio para el estado
             solicitud.estado = nuevo_estado
-            
+
             # Si es POR_REVISION, crear comentario obligatorio
             nueva_revision = None
             if nuevo_estado.upper() == 'POR_REVISION':
@@ -246,16 +255,17 @@ def cambiar_estado(request, pk):
                     template='presupuesto/solicitud_en_revision.html',
                     context=context
                 )
-            
+
             # Si es rechazada, guardamos el comentario en el campo específico
             if nuevo_estado.upper() == 'RECHAZADA':
                 solicitud.observaciones_supervisor = comentarios
-            
+
             # 4. Guardar cambios
             solicitud.save()
+            pendientes.sincronizar(request, solicitud)  # aprobada/rechazada/por revisión: se cierra para todos
 
-            serializer = BaseSerializer([solicitud])  
-            if nuevo_estado.upper() == 'RECHAZADA':          
+            serializer = BaseSerializer([solicitud])
+            if nuevo_estado.upper() == 'RECHAZADA':
                 context = {
                     'titulo': solicitud.titulo,
                     'sede': solicitud.ubicacion.nombre,
@@ -263,14 +273,14 @@ def cambiar_estado(request, pk):
                     'url_solicitud': FrontendRequest.VIEW.url(request, solicitud.id)
                 }
                 email_template = 'presupuesto/solicitud_rechazada.html'
-                
+
                 send_to_list = [solicitud.colaborador.email]
                 send_email(
-                    subject='Solicitud de Presupuesto', 
-                    send_to_list=send_to_list, 
-                    template=email_template, 
-                    context=context,                
-                )  
+                    subject='Solicitud de Presupuesto',
+                    send_to_list=send_to_list,
+                    template=email_template,
+                    context=context,
+                )
             return JsonResponse({
                 "mensaje": f"Estado actualizado a {nuevo_estado} con éxito",
                 "newRevisionId": nueva_revision.id if nueva_revision else None
@@ -280,7 +290,7 @@ def cambiar_estado(request, pk):
             log_error(request, e, {'funcion': 'cambiar_estado', 'pk': pk})
             return JsonResponse({"error": str(e)}, status=400)
 
-    return JsonResponse({"error": "Método no permitido. Use PATCH"}, status=405)   
+    return JsonResponse({"error": "Método no permitido. Use PATCH"}, status=405)
 
 #@csrf_exempt
 @login_required_json
@@ -295,7 +305,7 @@ def eliminar_solicitud(request, pk):
 
             # 2. Seguridad: Verificar permisos
             # Solo permitimos borrar si es el dueño o si es un supervisor/admin
-            es_dueño = solicitud.colaborador == request.user
+            es_dueño = solicitud.colaborador_id == request.user.id
             if not (es_dueño or es_supervisor(request.user)):
                 return JsonResponse({
                     "error": "No tienes permiso para eliminar esta solicitud"
@@ -307,6 +317,7 @@ def eliminar_solicitud(request, pk):
 
             # 4. Eliminar de la base de datos
             solicitud.delete()
+            pendientes.borrar(pk)
 
             return JsonResponse({"mensaje": "Solicitud eliminada con éxito"}, status=200)
 
@@ -326,7 +337,7 @@ def eliminar_adjunto(request, pk):
             with transaction.atomic():
                 # 1. Primero intentamos eliminar de Google Drive
                 # Si esto falla, lanzará una excepción y no se borrará de la DB
-                delete_from_drive(drive_id)                
+                delete_from_drive(drive_id)
                 # 2. Si lo anterior tuvo éxito, borramos de la base de datos
                 adjunto.delete()
 
@@ -335,11 +346,11 @@ def eliminar_adjunto(request, pk):
             }, status=200)
 
         except Exception as e:
-            # Si el error es 404, el archivo ya no está en Drive, 
+            # Si el error es 404, el archivo ya no está en Drive,
             # así que procedemos a borrar el registro de la DB de todos modos.
             if "File not found" in str(e) or "404" in str(e):
                 adjunto.delete()
-                return JsonResponse({"mensaje": "El archivo no existía en Drive, registro local eliminado."}, status=200)     
+                return JsonResponse({"mensaje": "El archivo no existía en Drive, registro local eliminado."}, status=200)
             log_error(request, e, {'funcion': 'eliminar_adjunto', 'pk': pk})
             return JsonResponse({"error": str(e)}, status=400)
 
@@ -363,6 +374,7 @@ def confirmar_solicitud(request, pk):
             # 2. Actualizar el campo confirmado
             solicitud.confirmado = True
             solicitud.save()
+            pendientes.sincronizar(request, solicitud)  # Compras ya la confirmó: se cierra su pendiente
 
             return JsonResponse({
                 "mensaje": "Solicitud confirmada exitosamente",
@@ -397,6 +409,9 @@ def cambiar_estado_revision(request, pk):
             if not solicitud.revisiones.exclude(estado='RESUELTA').exists():
                 solicitud.estado = 'PENDIENTE'
                 solicitud.save()
+            # Todas resueltas: el del colaborador se cierra y vuelve el de los Supervisores. Si no, se actualiza
+            # cuántas observaciones le faltan al colaborador.
+            pendientes.sincronizar(request, solicitud)
 
             return JsonResponse({
                 "mensaje": f"Estado de la revision actualizado a {nuevo_estado}",

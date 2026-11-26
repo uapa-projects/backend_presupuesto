@@ -10,7 +10,6 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/4.2/ref/settings/
 """
 import os
-from corsheaders.defaults import default_headers
 from pathlib import Path
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -30,7 +29,6 @@ DEBUG = False
 
 ALLOWED_HOSTS = [
     'gtsst.uapa.edu.do',
-    'abiotic-kenzie-braggadocian.ngrok-free.dev',
     'localhost',
     '34.121.55.146',
     '127.0.0.1',
@@ -48,9 +46,13 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'corsheaders',
+    'authentication',
     'presupuesto',
     'emails'
 ]
+
+# Nadie se autentica contra la base de CEP (auth_user queda vacía): lo hace la plataforma.
+AUTHENTICATION_BACKENDS = []
 
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
@@ -58,37 +60,41 @@ MIDDLEWARE = [
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
-    'django.contrib.auth.middleware.AuthenticationMiddleware',
+    # Sin usuarios locales: request.user es el usuario de la plataforma, armado desde la sesión.
+    'authentication.usuario_plataforma.PlataformaAuthMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
+    # SSO con la plataforma: entrada automática con las cookies compartidas y revalidación cada 5 minutos.
+    'authentication.middleware.PlataformaMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
 
+# Proxies (Apache) cuya cabecera X-Forwarded-For se cree para saber la IP del usuario final, que se envía a la
+# plataforma en X-Client-IP (límite de intentos de login por IP).
+PLATFORM_TRUSTED_PROXIES = ['127.0.0.1', '::1']
+
+# La SPA se sirve desde el mismo origen que la API (y Vite usa un proxy en desarrollo), así que ya no hace falta
+# abrir CORS a cualquier origen: con credenciales, eso dejaba a cualquier sitio leer la API con la sesión del usuario.
 CORS_ALLOWED_ORIGINS = [
     "http://34.121.55.146:8081",
-    "https://*.usercontent.goog",
-    "https://abiotic-kenzie-braggadocian.ngrok-free.dev",
-    "http://localhost:3000", 
+    "http://localhost:3000",
     'http://127.0.0.1:3000',
     'https://cep.uapa.edu.do'
 ]
-CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOWED_ORIGIN_REGEXES = [r'^https://[\w.-]+\.usercontent\.goog$']
+CORS_ALLOW_ALL_ORIGINS = False
 CORS_ALLOW_CREDENTIALS = True
 
-CORS_ALLOW_HEADERS = list(default_headers) + [
-    'ngrok-skip-browser-warning',
-]
 CSRF_COOKIE_HTTPONLY = False
 SESSION_COOKIE_HTTPONLY = True
-SESSION_COOKIE_SECURE = True   # Obligatorio porque ngrok usa HTTPS
-SESSION_COOKIE_SAMESITE = 'None'
-#CSRF_COOKIE_SAMESITE = 'None'
+SESSION_COOKIE_SECURE = True
+# El login es en el mismo sitio (ventana #acceso + fetch), ya no desde Netlify: Lax basta y protege contra CSRF.
+SESSION_COOKIE_SAMESITE = 'Lax'
 
 CSRF_TRUSTED_ORIGINS = [
     "http://34.121.55.146:8081",
     'http://localhost:3000',
     'http://127.0.0.1:3000',
     "https://*.usercontent.goog",
-    "https://abiotic-kenzie-braggadocian.ngrok-free.dev",
     "https://gtsst.uapa.edu.do",
     "https://cep.uapa.edu.do"
 ]
@@ -104,7 +110,9 @@ REACT_APP_DIR = os.path.join(BASE_DIR, 'frontend')
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [REACT_APP_DIR],
+        # Las pantallas son de React (frontend/index.html se entrega tal cual, sin plantillas). Quedan las
+        # plantillas de las apps: admin, correos y PDF del certificado.
+        'DIRS': [],
         'APP_DIRS': True,
         'OPTIONS': {
             'context_processors': [
@@ -231,6 +239,15 @@ LOGGING = {
             'class': 'logging.StreamHandler',
             'formatter': 'verbose',
         },
+        'plataforma': {
+            'level': 'INFO',
+            'class': 'logging.handlers.TimedRotatingFileHandler',
+            'filename': str(LOGS_DIR / 'plataforma.log'),
+            'formatter': 'verbose',
+            'when': 'midnight',
+            'interval': 1,
+            'backupCount': 7,
+        },
     },
     'loggers': {
         'django': {
@@ -241,6 +258,12 @@ LOGGING = {
         'core': {
             'handlers': ['file', 'console'],
             'level': 'ERROR',
+            'propagate': False,
+        },
+        # Acceso por la plataforma: también las advertencias (sin contraseñas ni tokens).
+        'core.plataforma': {
+            'handlers': ['plataforma', 'console'],
+            'level': 'INFO',
             'propagate': False,
         },
     },

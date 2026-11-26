@@ -1,9 +1,8 @@
 from django.conf import settings
-from django.shortcuts import get_object_or_404
-from django.contrib.auth.models import Group
+from authentication import directorio, plataforma
+from authentication.roles import ROL_COMPRA_RCO, ROL_COMPRA_RSD, ROL_COMPRA_RSS
 from emails.mailer import send_email
 from presupuesto.models import Configuracion
-from .models import Sede
 from enum import Enum
 
 class FrontendRequest(Enum):
@@ -18,10 +17,10 @@ class FrontendRequest(Enum):
         """
         # 1. Obtenemos el path relativo del Enum (ej: /request/8/)
         path_del_enum = self.value.format(id=solicitud_id)
-        
+
         # 2. Limpiamos el prefijo de settings para evitar dobles barras
         prefijo = settings.PREFIX_URL.rstrip('/')
-        
+
         # 3. Combinamos: /presupuesto + /request/8/
         full_path = f"{prefijo}{path_del_enum}"
         print(full_path)
@@ -30,12 +29,12 @@ class FrontendRequest(Enum):
 
 
 def enviar_email_solicitud_creada(context):
-    template='presupuesto/nueva_solicitud.html'            
+    template='presupuesto/nueva_solicitud.html'
     usuarios_value = Configuracion.get_value('CORREOS_NUEVAS_SOLICITUDES')
     if usuarios_value:
         send_to_list = [email.strip() for email in usuarios_value.replace(';', ',').split(',') if email.strip()]
     else:
-        send_to_list = []  
+        send_to_list = []
     send_email(
                 subject='Nueva Solicitud de Presupuesto',
                 send_to_list=send_to_list,
@@ -43,25 +42,36 @@ def enviar_email_solicitud_creada(context):
                 context=context
             )
 
-def enviar_email_a_compras(request, solicitud):    
-    email_template = 'presupuesto/emision_certificado_a_compra.html'
-    sede = get_object_or_404(Sede, id=solicitud.ubicacion.id)
-    sede_codigo = sede.codigo
-    
-    grupos_a_notificar = ['Compra RSS']
-    
+def roles_compras(sede_codigo):
+    """Roles de Compra que atienden una sede: Compra RSS siempre, más el de la sede si es RCO o RSD."""
+    roles_a_notificar = [ROL_COMPRA_RSS]
     if sede_codigo == 'RCO':
-        grupos_a_notificar.append('Compra RCO')
+        roles_a_notificar.append(ROL_COMPRA_RCO)
     elif sede_codigo == 'RSD':
-        grupos_a_notificar.append('Compra RSD')
-    
+        roles_a_notificar.append(ROL_COMPRA_RSD)
+    return roles_a_notificar
+
+
+def correos_compras(solicitud):
+    """Correos de quienes tienen los roles de Compra de la sede de la solicitud (los dice la plataforma)."""
+    correos = []
+    for rol in roles_compras(solicitud.ubicacion.codigo):
+        for usuario in directorio.buscar_usuarios(app=plataforma.app_slug(), rol=rol, limit=500):
+            if usuario.get('email') and usuario['email'] not in correos:
+                correos.append(usuario['email'])
+    return correos
+
+
+def enviar_email_a_compras(request, solicitud):
+    email_template = 'presupuesto/emision_certificado_a_compra.html'
+    sede = solicitud.ubicacion
+
     send_to_list = [solicitud.colaborador.email]
-    for grupo_nombre in grupos_a_notificar:
-        grupo = Group.objects.filter(name=grupo_nombre).first()
-        if grupo:
-            emails = grupo.user_set.values_list('email', flat=True)
-            send_to_list.extend(emails)
-       
+    # Quién tiene cada rol de Compra en CEP lo dice la plataforma (directorio).
+    for email in correos_compras(solicitud):
+        if email not in send_to_list:
+            send_to_list.append(email)
+
     context={
         'solicitante': solicitud.colaborador.get_full_name(),
         'titulo': solicitud.titulo,
@@ -70,8 +80,8 @@ def enviar_email_a_compras(request, solicitud):
         'url_solicitud': FrontendRequest.CONFIRM.url(request, solicitud.id)
     }
     send_email(
-        subject='Presupuesto Aprobado', 
-        send_to_list=send_to_list, 
-        template=email_template, 
-        context=context,                
+        subject='Presupuesto Aprobado',
+        send_to_list=send_to_list,
+        template=email_template,
+        context=context,
     ) 

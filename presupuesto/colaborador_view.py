@@ -9,4 +9,4 @@ class MisSolicitudesView(LoginRequiredMixin, ListView):
 
     def get_queryset(self):
         # Filtro estricto: solo lo que pertenece al usuario logueado
-        return SolicitudPresupuesto.objects.filter(colaborador=self.request.user).order_by('-fecha_solicitud')
+        return SolicitudPresupuesto.objects.filter(colaborador_id=self.request.user.id).order_by('-fecha_solicitud')

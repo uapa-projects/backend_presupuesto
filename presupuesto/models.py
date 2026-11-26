@@ -1,39 +1,30 @@
 from django.db import models
-from django.conf import settings
 from datetime import date
 
-from django.db.models.signals import post_save
-from django.dispatch import receiver
-from django.contrib.auth.models import User, Group
+from authentication import directorio
 
-@receiver(post_save, sender=User)
-def asignar_grupo_colaborador(sender, instance, created, **kwargs):
-    if created:
-        # Buscamos el grupo (asegúrate de que el nombre sea exacto)
-        grupo, _ = Group.objects.get_or_create(name='Colaborador')
-        instance.groups.add(grupo)
-        
-class Sede(models.Model):
-    codigo = models.CharField(max_length=3, unique=True)
-    nombre = models.CharField(max_length=100)
-    
-    def __str__(self):
-        return f"{self.codigo} - {self.nombre}"
+# CEP no guarda usuarios ni sedes: colaborador_id / supervisor_id son el UUID del usuario en services_auth_db y
+# ubicacion_id el del recinto (RSS, RSD, RCO). Las propiedades `colaborador`, `supervisor` y `ubicacion` los
+# resuelven con el directorio de la plataforma (authentication/directorio.py: Persona y SedeCEP).
+
+
+def _persona_o_id(valor):
+    return getattr(valor, 'id', valor)
 
 class CuentaAnalitica(models.Model):
     codigo = models.CharField(max_length=20)
     nombre = models.CharField(max_length=100)
-    
+
     def __str__(self):
         return f"{self.codigo} - {self.nombre}"
 
 class CuentaContable(models.Model):
     codigo = models.CharField(max_length=20, unique=True)
     nombre = models.CharField(max_length=100)
-    
+
     def __str__(self):
         return f"{self.codigo} - {self.nombre}"
-    
+
     class Meta:
         ordering = ['codigo']
 
@@ -44,60 +35,73 @@ class SolicitudPresupuesto(models.Model):
         ('APROBADA', 'Aprobada'),
         ('RECHAZADA', 'Rechazada'),
     ]
-    
+
     TIPO_CHOICES = [
         ('DESEMBOLSO', 'Desembolso'),
         ('DESVIACION', 'Desviación'),
     ]
-    
+
     RUBRO_CHOICES = [
         ('SERVICIOS', 'Gastos de servicios y suministros'),
         ('ACTIVIDADES', 'Plan de actividades'),
         ('INVERSION', 'Inversión'),
     ]
 
-    # Relación con el Colaborador
-    colaborador = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    # Colaborador que la pide: UUID del usuario en la plataforma (sin FK).
+    colaborador_id = models.UUIDField(db_index=True)
     fecha_solicitud = models.DateTimeField(auto_now_add=True)
     fecha_actividad = models.DateField(default=date.today)
     titulo = models.CharField(max_length=200, verbose_name="Nombre de la solicitud")
     descripcion = models.TextField()
-    
+
     tipo_solicitud = models.CharField(max_length=20, choices=TIPO_CHOICES)
     rubro_presupuestal = models.CharField(max_length=20, choices=RUBRO_CHOICES)
-    
-    ubicacion = models.ForeignKey(Sede, on_delete=models.PROTECT)
+
+    # Sede: UUID del recinto en la plataforma (sin FK).
+    ubicacion_id = models.UUIDField(db_index=True)
     cuenta_analitica = models.ForeignKey(CuentaAnalitica, on_delete=models.PROTECT)
     cuenta_contable = models.ForeignKey(CuentaContable, on_delete=models.PROTECT, null=True, blank=True)
-    
+
     presupuesto_pre_aprobado = models.DecimalField(max_digits=12, decimal_places=2)
     monto_a_ejecutar = models.DecimalField(max_digits=12, decimal_places=2)
-    
+
     estado = models.CharField(max_length=15, choices=ESTADO_CHOICES, default='PENDIENTE')
     confirmado = models.BooleanField(default=False, verbose_name="Confirmado")
     # Nombre más apropiado para el motivo de rechazo
     observaciones_supervisor = models.TextField(blank=True, null=True, verbose_name="Observaciones de Revisión")
     updated_at = models.DateTimeField(auto_now=True)
-    
+
+    @property
+    def colaborador(self):
+        return directorio.persona(self.colaborador_id)
+
+    @colaborador.setter
+    def colaborador(self, valor):
+        self.colaborador_id = _persona_o_id(valor)
+
+    @property
+    def ubicacion(self):
+        return directorio.sede_cep(self.ubicacion_id)
+
+    @ubicacion.setter
+    def ubicacion(self, valor):
+        self.ubicacion_id = _persona_o_id(valor)
+
     @property
     def get_nombre_colaborador(self):
-        # get_full_name() es un método estándar de Django que une first_name y last_name
-        return self.colaborador.get_full_name()
-    
+        return directorio.nombre_usuario(self.colaborador_id)
+
     def __str__(self):
-        return f"{self.titulo} - {self.colaborador.get_full_name()}"
+        return f"{self.titulo} - {directorio.nombre_usuario(self.colaborador_id)}"
 
 class RevisionSolicitud(models.Model):
     solicitud = models.ForeignKey(
-        SolicitudPresupuesto, 
-        on_delete=models.CASCADE, 
+        SolicitudPresupuesto,
+        on_delete=models.CASCADE,
         related_name='revisiones'
     )
-    supervisor = models.ForeignKey(
-        settings.AUTH_USER_MODEL, 
-        on_delete=models.CASCADE,
-        related_name='comentarios_hechos'
-    )
+    # Quien la pidió: UUID del usuario en la plataforma (sin FK).
+    supervisor_id = models.UUIDField(db_index=True)
     contenido = models.TextField()
     fecha_creacion = models.DateTimeField(auto_now_add=True)
     estado = models.CharField(
@@ -106,17 +110,25 @@ class RevisionSolicitud(models.Model):
         default='PENDIENTE'
     )
 
+    @property
+    def supervisor(self):
+        return directorio.persona(self.supervisor_id)
+
+    @supervisor.setter
+    def supervisor(self, valor):
+        self.supervisor_id = _persona_o_id(valor)
+
     def __str__(self):
-        return f"Revision en {self.solicitud.titulo} por {self.supervisor.get_full_name()}"
+        return f"Revision en {self.solicitud.titulo} por {directorio.nombre_usuario(self.supervisor_id)}"
 
 class AdjuntoSolicitud(models.Model):
     # Relación directa: Si se borra la solicitud, se borran las referencias de sus adjuntos
     solicitud = models.ForeignKey(
-        SolicitudPresupuesto, 
-        on_delete=models.CASCADE, 
+        SolicitudPresupuesto,
+        on_delete=models.CASCADE,
         related_name='adjuntos'
     )
-    
+
     # Campos de metadata y Drive
     nombre = models.CharField(max_length=255, verbose_name="Nombre del archivo")
     drive_id = models.CharField(max_length=255, unique=True)
@@ -178,27 +190,27 @@ class SecuenciaCertificado(models.Model):
     def get_next_number(cls):
         from django.utils import timezone
         current_year = timezone.now().year
-        
+
         secuencia, created = cls.objects.get_or_create(
             anno=current_year,
             defaults={'numero': 0}
         )
-        
+
         return secuencia.numero + 1
 
     @classmethod
     def increment_sequence(cls):
         from django.utils import timezone
         current_year = timezone.now().year
-        
+
         secuencia, created = cls.objects.get_or_create(
             anno=current_year,
             defaults={'numero': 0}
         )
-        
+
         secuencia.numero += 1
         secuencia.save()
-        
+
         return secuencia.numero
 
     def __str__(self):

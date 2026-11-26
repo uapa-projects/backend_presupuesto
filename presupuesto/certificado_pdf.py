@@ -1,18 +1,20 @@
 from django.template.loader import render_to_string
 from django.http import HttpResponse, JsonResponse
 from django.shortcuts import render, get_object_or_404
-from django.views.decorators.csrf import csrf_exempt
 from django.urls import reverse
 from django.conf import settings
 from django.core.files.base import ContentFile
-from weasyprint import HTML
+# from weasyprint import HTML
 from core.utils.logging import log_error
+from core.utils.login_required import login_required_json
 from .models import SolicitudPresupuesto, Configuracion, AdjuntoSolicitud, SecuenciaCertificado, CuentaContable
 from .google_drive import obtener_carpeta_en_drive, upload_to_drive
 from datetime import datetime
 import json
+from . import pendientes
 from .utils import enviar_email_a_compras
 
+@login_required_json
 def get_certificado_template(request, pk):
     solicitud = get_object_or_404(SolicitudPresupuesto, pk=pk)              
     fecha_aprobacion = datetime.now().strftime('%d/%m/%Y')
@@ -33,7 +35,7 @@ def get_certificado_template(request, pk):
         'aprobado_por': request.user.get_full_name()
         #'submit_url': submit_url,
     })
-@csrf_exempt
+@login_required_json  # con sesión y con CSRF: el frontend envía X-CSRFToken
 def generar_certificado_pdf(request, pk):
         
     if request.method != 'POST':
@@ -92,6 +94,7 @@ def generar_certificado_pdf(request, pk):
         SecuenciaCertificado.increment_sequence()
 
         enviar_email_a_compras(request, solicitud)
+        pendientes.sincronizar(request, solicitud)  # con certificado (y aprobada): «Confirmar solicitud» para Compras
         return JsonResponse({
             'drive_id': resultado_drive['id'],
             'url_view': resultado_drive['webViewLink']
@@ -104,5 +107,6 @@ def generate_pdf(request, template, context, filename):
     html_string = render_to_string(template, context)    
     prefijo = settings.PREFIX_URL.rstrip('/')
     base_url = request.build_absolute_uri(prefijo)
-    pdf_file = HTML(string=html_string, base_url=base_url).write_pdf()
-    return pdf_file
+    # pdf_file = HTML(string=html_string, base_url=base_url).write_pdf()
+    # return pdf_file
+    raise NotImplementedError("Generación de PDF deshabilitada: WeasyPrint está comentado")
